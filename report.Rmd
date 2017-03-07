@@ -1,0 +1,258 @@
+---
+title: "ISIS tweet Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## This report is about ISIS tweet analyzing 
+
+Your task is to identify who the key players in ISIS are based on their Twitter activity. You can quantity influence in many ways, such as number of followers, rate of follower acquisition, average number of views per tweet, etc. Here is a brief description of the dataset:
+
+Name,
+
+Username,
+
+Description,
+
+Location,
+
+Number of followers at the time the tweet was downloaded,
+
+Number of statuses by the user when the tweet was downloaded,
+
+Date and timestamp of the tweet,
+
+The tweet itself
+
+###Task:1. Find the top influceners 2. other graph related to this analysis
+
+Performing Environment:
+
+R version 3.3.2 (2016-10-31) -- "Sincere Pumpkin Patch"
+
+Platform: x86_64-apple-darwin13.4.0 (64-bit)
+
+
+
+```{r}
+#import the libraries that we need
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(plotly)
+library(knitr)
+library(stringr)
+library(tm)
+library(wordcloud)
+library(formattable)
+library(twitteR)
+library(FactoMineR)
+library(cluster)
+
+```
+
+#Let's see what they are tweeting at first
+Conducting text mining on this task at first and generating the word graph that demonstrate the highly mentioned words
+
+```{r}
+isis <- read.csv('ISIStweets.csv') #import csv
+isisSub <- subset(isis) #make a set that I can play around
+
+#clean the text
+isisSub$tweets <- gsub("(RT|via)((?:\\b\\W*@\\w+)+)", "", isisSub$tweets) 
+isisSub$tweets <- gsub("[[:punct:]]", "", isisSub$tweets)
+isisSub$tweets <- gsub("[[:digit:]]", "", isisSub$tweets)
+isisSub$tweets <- gsub("http\\w+", "", isisSub$tweets)
+isisSub$tweets <- gsub("[ \t]{2,}", "", isisSub$tweets)
+isisSub$tweets <- gsub("^\\s+|\\s+$", "", isisSub$tweets)
+isisSub$tweets <- gsub("amp", "", isisSub$tweets)
+isisSub$tweets <- tolower(isisSub$tweets)
+
+#pick the stop words ("will","near","now","one")
+isisSub$tweets <- removeWords(isisSub$tweets, c(stopwords(),"will","near","now","one"))
+isisSub$tweets <- gsub("english translation", "", isisSub$tweets)
+```
+
+#Turn text in to corpus then we can make a matrix to caculate the word weight
+
+```{r}
+#corpus the text into a doc, and pick column 8 "tweets" as target set
+isiscorp <- Corpus(VectorSource(isisSub))
+tweets <- Corpus(VectorSource(isiscorp[[8]]$content))
+```
+
+```{r}
+#turn text to matrix and applies tfidf to get rid of useless words. noted that here normzlied by weight 
+tdm = TermDocumentMatrix(tweets, control = list(weighting = function(x) weightTfIdf(x, normalize = TRUE),stopwords = TRUE))
+```
+
+```{r}
+#create the matrix
+m = as.matrix(tdm)
+#remove sparse terms (word frequency > 99.9% percentile)
+wf = rowSums(m)
+m1 = m[wf>quantile(wf,probs=0.999), ]
+
+m1 = m1[,colSums(m1)!=0] # remove columns with all zeros to shrink the size of matrix
+
+m1[m1 > 1] = 1 #turn matrix entry into binary (0 or 1)
+
+# plot the top 20 words that mentioned 
+freq=rowSums(as.matrix(m1))
+high.freq=tail(sort(freq),n=20) #top20
+hfp.df=as.data.frame(sort(high.freq))
+hfp.df$names <- rownames(hfp.df)
+```
+
+#Let's see top 20 mentioned words in the tweets after creating the matrix 
+```{r echo=FALSE}
+ggplot(hfp.df, aes(reorder(names,high.freq), high.freq)) +
+  geom_bar(stat="identity") + coord_flip() + 
+  xlab("Terms") + ylab("Frequency") +
+  ggtitle("Term frequencies")
+```
+You can see the top 20 mentioned words the frequency are all above 200
+
+#Now we want to see the words relationship network
+
+```{r}
+#build a graph of these terms
+library(igraph)
+tweetMatrix <- m1 %*% t(m1) # adjancent matrix
+tweetMatrix[5:10,5:10]
+g <- graph.adjacency(tweetMatrix, weighted=T, mode = "undirected")
+g <- simplify(g)
+
+V(g)$label <- V(g)$name
+V(g)$degree <- degree(g)
+set.seed(4000)
+layout1 <- layout.fruchterman.reingold(g)
+plot(g, layout=layout1)
+
+```
+
+#I'm curiouse that where did they tweet so I started looking for the locations
+
+However, the original data only provides the name of the location but not the coordinate, otherwise I can generate a figure by using "ggmap".
+
+I defined the top 10 location by the frequency of tweets
+
+```{r}
+location <-
+  isis %>%
+  group_by(location) %>%
+  summarize(freq=n()) %>%
+  arrange(desc(freq))
+
+location %>%
+  summarise(maxlocation = max(freq), minlocation = min(freq))
+
+topLocation <-
+  location %>%
+  top_n(n = 10) %>%
+  left_join(isis) %>%
+  group_by(location)
+```
+
+#The Top 10 Location 
+```{r echo=FALSE}
+topLocation %>% 
+  summarize(freq = max(numberstatuses)) %>%
+  ggplot(aes(as.factor(location), freq)) +
+  geom_bar(stat = "identity") +
+  xlab("location") +
+  theme(axis.text.x = element_text(angle=60, hjust=1), 
+        axis.text=element_text(size=14), 
+        axis.title=element_text(size=16))
+```
+
+For the top 10 location histogram, it's not very helpful.
+
+
+#Now we are going to define who is the top influencer
+```{r}
+# I defined audiance data frame as user name, followers and actual tweets
+audiance<-isis%>%
+  select(name,followers,tweets)%>%
+  group_by(name)%>%
+  summarize(FollowerNumbers=max(followers),tweetNumbers=n())
+```
+
+#Creating a k-mean cluster will be a fast way to go to see who are the top influencer
+
+```{r}
+wss <- numeric(15)
+for (k in 1:15) {wss[k] <- sum(kmeans(as.matrix(audiance[, 2:3]), centers=k, nstart=25)$withinss)}
+```
+We got to know how many clusters we need in k-mean so visualized wss to find the elbow point will be a nice indicator
+```{r}
+#get the elbow point plot
+plot(1:15, wss, type="b", xlab="Number of Clusters",
+     ylab="Within groups sum of squares")
+
+#the elbow point is 3 so we use 3 as our cluster number for k-means
+set.seed(100)
+ISIScluster <- kmeans(as.matrix(audiance[, 2:3]), 3, nstart = 20)
+```
+#The actul k-means looks like this
+```{r echo=FALSE}
+clusplot(audiance, ISIScluster$cluster, color=TRUE, shade=TRUE, labels=3, lines=0)
+```
+
+#The scatter plot demonstrate who are the top influencer
+```{r echo=FALSE}
+scatter<-audiance%>%
+  ggplot(aes(tweetNumbers,FollowerNumbers))+
+  geom_point(aes(color=factor(ISIScluster$cluster)))+
+  geom_text(aes(label=ifelse(FollowerNumbers>7000|tweetNumbers>800,as.character(name),'')),vjust=1.5)+
+  guides(color=FALSE)+
+  ggtitle('Tweet Activity vs Influence')
+ggplotly()
+```
+
+# When do clustering, applying other clustering method to see the consensus will be a better approach to avoid bias
+
+so here we are applying Hierarchical Clustering. No.90 is Rami, you can see this guy is the outliner. The cluster to the right is the highly active group.
+```{r}
+# Ward Hierarchical Clustering
+d <- dist(audiance[,2:3], method = "euclidean") # distance matrix
+fit <- hclust(d, method="ward.D") 
+```
+
+```{r echo=FALSE}
+#Check the hierachical cluster first
+plot(fit, labels = NULL, hang = 0.1, 
+     main = "Cluster dendrogram", sub = NULL,
+     xlab = NULL, ylab = "Height")
+```
+
+#The scatter plot of the Hierarchical Clustering and we can see it is very similar to k-means clustering
+```{r echo=FALSE}
+scatter<-audiance%>%
+  ggplot(aes(tweetNumbers,FollowerNumbers))+
+  geom_point(aes(color=factor(fit$order)))+ #based on order
+  geom_text(aes(label=ifelse(FollowerNumbers>7000|tweetNumbers>800,as.character(name),'')),vjust=1.5)+
+  guides(color=FALSE)+
+  ggtitle('Tweet Activity vs Influence')
+ggplotly()
+```
+
+In conclusion, Rami, War BreakingNews, Conflict Reporter and Salahuddin Ayudi are the top influcener. 
+
+
+#References
+
+ggents:https://briatte.github.io/ggnet/
+  (Example (4): French MPs on Twitter)
+  
+Social Network Analysis : http://www.rdatamining.com/examples/social-network-analysis
+
+text_cleaning: https://sites.google.com/site/miningtwitter/questions/talking-about/given-users
+
+tf-idf: https://cran.r-project.org/web/packages/tidytext/vignettes/tf_idf.html
+
+clusering: http://www.statmethods.net/advstats/cluster.html
